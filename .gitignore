@@ -1,0 +1,6 @@
+/upstream/
+/dist/
+/build/
+*.class
+.DS_Store
+Thumbs.db
