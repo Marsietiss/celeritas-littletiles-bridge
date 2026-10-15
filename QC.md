@@ -2,7 +2,11 @@
 
 Three independent agents reviewed rendering/geometry, threading/resources, and loader/mod compatibility. The primary agent checked the two reported issues against the source and verified that the installed experimental JAR matches the reviewed build (`29BACAD420D959979CA5FC624B4A2617E7D7B99A99D7B05D32D7B45A48392337`).
 
-## Findings
+## Resolution status
+
+Both findings below apply to the first prototype. The standalone `ltbridge2` patch now preserves vertex alpha and synchronizes the cache protocol, with 1,047 targeted regression checks and 16 buffer-copy checks passing. Full in-game regression coverage of this revision remains pending. The separate Demonica route uses the same cache hardening and disables stock Celeritas render-pass optimization as the transparency workaround.
+
+## Findings in ltbridge1
 
 ### P2 — Translucent paint can be sent to the opaque render pass
 

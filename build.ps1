@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Stop'
 $baseCommit = '7818b33172086d0576456a3acf04e1548ddbed74'
 $sourceDir = Join-Path $PSScriptRoot 'upstream'
-$patchFile = Join-Path $PSScriptRoot 'celeritas-ltbridge1.patch'
+$patchFile = Join-Path $PSScriptRoot 'celeritas-ltbridge2.patch'
 
 function Invoke-GitChecked {
     param([string[]]$GitArguments)
@@ -37,7 +37,7 @@ $jars = @(Get-ChildItem -LiteralPath (Join-Path $sourceDir 'build\libs') -Recurs
 if ($jars.Count -ne 1) { throw 'Expected one packaged 1.12.2 JAR; inspect upstream/build/libs.' }
 $dist = Join-Path $PSScriptRoot 'dist'
 New-Item -ItemType Directory -Path $dist -Force | Out-Null
-$output = Join-Path $dist 'celeritas-forge-mc12.2-2.5.0-dev-ltbridge1-experimental.jar'
+$output = Join-Path $dist 'celeritas-forge-mc12.2-2.5.0-dev-ltbridge2-experimental.jar'
 Copy-Item -LiteralPath $jars[0].FullName -Destination $output -Force
 Write-Output "Built: $output"
 Write-Output 'Experimental build; see QC.md before installing. No Minecraft instance was modified.'

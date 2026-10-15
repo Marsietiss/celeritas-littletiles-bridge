@@ -3,7 +3,7 @@ set -euo pipefail
 root="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 source_dir="$root/upstream"
 base_commit=7818b33172086d0576456a3acf04e1548ddbed74
-patch_file="$root/celeritas-ltbridge1.patch"
+patch_file="$root/celeritas-ltbridge2.patch"
 
 if [[ ! -e "$source_dir" ]]; then
     git clone --no-checkout --filter=blob:none https://git.taumc.org/embeddedt/celeritas.git "$source_dir"
@@ -27,6 +27,6 @@ while IFS= read -r -d '' jar; do
 done < <(find "$source_dir/build/libs" -type f -name 'celeritas-forge-mc12.2-*.jar' -print0)
 [[ ${#jars[@]} -eq 1 ]] || { echo 'Expected one packaged JAR; inspect build/libs.' >&2; exit 1; }
 mkdir -p "$root/dist"
-output="$root/dist/celeritas-forge-mc12.2-2.5.0-dev-ltbridge1-experimental.jar"
+output="$root/dist/celeritas-forge-mc12.2-2.5.0-dev-ltbridge2-experimental.jar"
 cp -- "${jars[0]}" "$output"
 printf 'Built: %s\nExperimental build; see QC.md. No Minecraft instance was modified.\n' "$output"

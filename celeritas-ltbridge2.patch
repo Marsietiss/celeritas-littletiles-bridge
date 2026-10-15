@@ -1,0 +1,497 @@
+diff --git a/forge122/src/main/java/org/taumc/celeritas/CeleritasVintage.java b/forge122/src/main/java/org/taumc/celeritas/CeleritasVintage.java
+index 610fb4b..1dc4639 100644
+--- a/forge122/src/main/java/org/taumc/celeritas/CeleritasVintage.java
++++ b/forge122/src/main/java/org/taumc/celeritas/CeleritasVintage.java
+@@ -40,6 +40,7 @@ public class CeleritasVintage {
+ 
+     @EventHandler
+     public void onInit(FMLInitializationEvent event) {
++        org.taumc.celeritas.impl.compat.littletiles.LittleTilesCompat.initialize();
+         if ((Boolean) Launch.blackboard.get("fml.deobfuscatedEnvironment")) {
+             ClientCommandHandler.instance.registerCommand(new TogglePassCommand());
+         }
+diff --git a/forge122/src/main/java/org/taumc/celeritas/core/CeleritasLoadingPlugin.java b/forge122/src/main/java/org/taumc/celeritas/core/CeleritasLoadingPlugin.java
+index d82b4f8..55561d2 100644
+--- a/forge122/src/main/java/org/taumc/celeritas/core/CeleritasLoadingPlugin.java
++++ b/forge122/src/main/java/org/taumc/celeritas/core/CeleritasLoadingPlugin.java
+@@ -4,7 +4,7 @@ import net.minecraftforge.fml.relauncher.IFMLLoadingPlugin;
+ import org.jetbrains.annotations.Nullable;
+ import zone.rong.mixinbooter.IEarlyMixinLoader;
+ 
+-import java.util.Collections;
++import java.util.Arrays;
+ import java.util.List;
+ import java.util.Map;
+ 
+@@ -38,6 +38,6 @@ public class CeleritasLoadingPlugin implements IFMLLoadingPlugin, IEarlyMixinLoa
+ 
+     @Override
+     public List<String> getMixinConfigs() {
+-        return Collections.singletonList("mixins.celeritas.json");
++        return Arrays.asList("mixins.celeritas.json", "mixins.celeritas.littletiles.json");
+     }
+ }
+diff --git a/forge122/src/main/java/org/taumc/celeritas/impl/compat/littletiles/LittleTilesBufferCopy.java b/forge122/src/main/java/org/taumc/celeritas/impl/compat/littletiles/LittleTilesBufferCopy.java
+new file mode 100644
+index 0000000..7a48e5d
+--- /dev/null
++++ b/forge122/src/main/java/org/taumc/celeritas/impl/compat/littletiles/LittleTilesBufferCopy.java
+@@ -0,0 +1,26 @@
++package org.taumc.celeritas.impl.compat.littletiles;
++
++import java.nio.ByteBuffer;
++import java.nio.ByteOrder;
++
++/** Copies a published LittleTiles cache without changing the shared buffer's cursor. */
++public final class LittleTilesBufferCopy {
++    private LittleTilesBufferCopy() {}
++
++    public static ByteBuffer independentView(ByteBuffer source) {
++        return source == null ? null : source.duplicate().order(source.order());
++    }
++
++    public static int[] snapshot(ByteBuffer source, int length, int stride) {
++        if (length < 0 || stride <= 0 || stride % 4 != 0 || length % (stride * 4) != 0
++                || length > source.limit()) {
++            throw new IllegalArgumentException("Invalid LittleTiles quad buffer: " + length);
++        }
++        ByteBuffer copy = source.duplicate().order(ByteOrder.nativeOrder());
++        copy.position(0);
++        copy.limit(length);
++        int[] data = new int[length / 4];
++        copy.asIntBuffer().get(data);
++        return data;
++    }
++}
+diff --git a/forge122/src/main/java/org/taumc/celeritas/impl/compat/littletiles/LittleTilesCompat.java b/forge122/src/main/java/org/taumc/celeritas/impl/compat/littletiles/LittleTilesCompat.java
+new file mode 100644
+index 0000000..5df0b25
+--- /dev/null
++++ b/forge122/src/main/java/org/taumc/celeritas/impl/compat/littletiles/LittleTilesCompat.java
+@@ -0,0 +1,204 @@
++package org.taumc.celeritas.impl.compat.littletiles;
++
++import net.minecraft.client.Minecraft;
++import net.minecraft.client.renderer.BufferBuilder;
++import net.minecraft.client.renderer.chunk.RenderChunk;
++import net.minecraft.client.renderer.vertex.DefaultVertexFormats;
++import net.minecraft.tileentity.TileEntity;
++import net.minecraft.util.BlockRenderLayer;
++import net.minecraft.util.math.BlockPos;
++import net.minecraft.world.World;
++import net.minecraftforge.common.MinecraftForge;
++import net.minecraftforge.event.world.WorldEvent;
++import net.minecraftforge.event.world.ChunkEvent;
++import net.minecraftforge.fml.common.Loader;
++import net.minecraftforge.fml.common.eventhandler.SubscribeEvent;
++import org.taumc.celeritas.CeleritasVintage;
++
++import java.lang.reflect.Field;
++import java.lang.reflect.Method;
++import java.nio.ByteBuffer;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++
++/** Bridge between LittleTiles' asynchronous mesh cache and Celeritas' chunk builder. */
++public final class LittleTilesCompat {
++    private static volatile boolean initialized;
++    private static volatile boolean available;
++    private static volatile World activeWorld;
++    private static Class<?> tileClass;
++    private static Field renderField;
++    private static Method chunkUpdate, getBufferCache, cacheGet, dataBuffer, dataLength;
++    private static final ConcurrentHashMap<BlockPos, BridgeRenderChunk> CHUNKS = new ConcurrentHashMap<>();
++    private static final Set<TileEntity> REQUESTS = ConcurrentHashMap.newKeySet();
++    private static boolean loggedFailure;
++
++    private LittleTilesCompat() {}
++
++    public static synchronized void initialize() {
++        if (initialized) return;
++        initialized = true;
++        if (!Loader.isModLoaded("littletiles")) return;
++        try {
++            ClassLoader loader = LittleTilesCompat.class.getClassLoader();
++            tileClass = Class.forName("com.creativemd.littletiles.common.tileentity.TileEntityLittleTiles", false, loader);
++            Class<?> manager = Class.forName("com.creativemd.littletiles.client.render.world.TileEntityRenderManager", false, loader);
++            Class<?> cache = Class.forName("com.creativemd.littletiles.client.render.cache.LayeredRenderBufferCache", false, loader);
++            Class<?> data = Class.forName("com.creativemd.littletiles.client.render.cache.IRenderDataCache", false, loader);
++            renderField = tileClass.getField("render");
++            chunkUpdate = manager.getMethod("chunkUpdate", Object.class);
++            getBufferCache = manager.getMethod("getBufferCache");
++            cacheGet = cache.getMethod("get", int.class);
++            dataBuffer = data.getMethod("byteBuffer");
++            dataLength = data.getMethod("length");
++            available = true;
++            MinecraftForge.EVENT_BUS.register(new WorldCleanup());
++            CeleritasVintage.logger().info("Experimental LittleTiles mesh bridge enabled (lt-bridge-2)");
++        } catch (ReflectiveOperationException e) {
++            throw new IllegalStateException("Unsupported LittleTiles API for the experimental Celeritas bridge", e);
++        }
++    }
++
++    public static boolean isLittleTile(TileEntity tile) {
++        return available && tileClass.isInstance(tile);
++    }
++
++    public static void requestCache(TileEntity tile) {
++        if (!REQUESTS.add(tile)) return;
++        Minecraft mc = Minecraft.getMinecraft();
++        mc.addScheduledTask(() -> {
++            try {
++                if (tile.isInvalid() || tile.getWorld() != mc.world) return;
++                Object manager = renderField.get(tile);
++                if (manager != null) chunkUpdate.invoke(manager, (Object) null);
++            } catch (ReflectiveOperationException e) {
++                reportFailure(e);
++            } finally {
++                REQUESTS.remove(tile);
++            }
++        });
++    }
++
++    public static void append(TileEntity tile, BlockRenderLayer layer, BufferBuilder destination) {
++        try {
++            Object manager = renderField.get(tile);
++            if (manager == null) return;
++            int[] vertices;
++            synchronized (manager) {
++                Object cache = getBufferCache.invoke(manager);
++                // Publication uses manager -> cache; transition packets only take cache.
++                // Hold both until the snapshot is complete, matching that lock order.
++                synchronized (cache) {
++                    Object data = cacheGet.invoke(cache, layer.ordinal());
++                    if (data == null) return;
++                    ByteBuffer source = (ByteBuffer) dataBuffer.invoke(data);
++                    int length = (Integer) dataLength.invoke(data);
++                    if (source == null || length == 0) return;
++                    vertices = LittleTilesBufferCopy.snapshot(source, length, DefaultVertexFormats.BLOCK.getSize());
++                }
++            }
++            // LittleTiles already stores positions relative to this 16-block section.
++            destination.addVertexData(vertices);
++        } catch (ReflectiveOperationException | IllegalArgumentException e) {
++            reportFailure(e);
++        }
++    }
++
++    private static synchronized void reportFailure(Exception e) {
++        if (!loggedFailure) {
++            loggedFailure = true;
++            CeleritasVintage.logger().error("LittleTiles bridge could not copy or rebuild a mesh", e);
++        }
++    }
++
++    /** Called by LittleTiles instead of looking for a vanilla ViewFrustum. */
++    public static RenderChunk getRenderChunk(BlockPos pos) {
++        Minecraft mc = Minecraft.getMinecraft();
++        World world = mc.world;
++        if (world == null) return null;
++        BlockPos origin = new BlockPos(pos.getX() & ~15, pos.getY() & ~15, pos.getZ() & ~15);
++        if (activeWorld == world) {
++            BridgeRenderChunk existing = CHUNKS.get(origin);
++            if (existing != null) return existing;
++        }
++        if (!mc.isCallingFromMinecraftThread()) {
++            mc.addScheduledTask(() -> {
++                if (mc.world == world) {
++                    getRenderChunk(origin);
++                    markDirty(world, origin);
++                }
++            });
++            return null;
++        }
++        if (activeWorld != world) {
++            clearChunks();
++            activeWorld = world;
++        }
++        if (!world.isBlockLoaded(origin)) return null;
++        return CHUNKS.computeIfAbsent(origin, key -> new BridgeRenderChunk(world, key));
++    }
++
++    private static void markDirty(World world, BlockPos origin) {
++        Minecraft mc = Minecraft.getMinecraft();
++        mc.addScheduledTask(() -> {
++            if (mc.world == world && mc.renderGlobal != null && world.isBlockLoaded(origin)) {
++                mc.renderGlobal.markBlockRangeForRenderUpdate(origin.getX(), origin.getY(), origin.getZ(),
++                        origin.getX() + 15, origin.getY() + 15, origin.getZ() + 15);
++            }
++        });
++    }
++
++    private static void clearChunks() {
++        // RenderChunk allocates GL buffers in its constructor; both allocation and disposal stay on the client thread.
++        CHUNKS.values().forEach(RenderChunk::deleteGlResources);
++        CHUNKS.clear();
++        REQUESTS.clear();
++        activeWorld = null;
++    }
++
++    public static final class WorldCleanup {
++        @SubscribeEvent
++        public void onChunkUnload(ChunkEvent.Unload event) {
++            World unloaded = event.getWorld();
++            int x = event.getChunk().x << 4;
++            int z = event.getChunk().z << 4;
++            if (unloaded.isRemote) Minecraft.getMinecraft().addScheduledTask(() -> {
++                if (activeWorld != unloaded) return;
++                CHUNKS.forEach((origin, chunk) -> {
++                    if (origin.getX() == x && origin.getZ() == z && CHUNKS.remove(origin, chunk)) {
++                        chunk.deleteGlResources();
++                    }
++                });
++            });
++        }
++
++        @SubscribeEvent
++        public void onUnload(WorldEvent.Unload event) {
++            World unloaded = event.getWorld();
++            if (unloaded.isRemote) Minecraft.getMinecraft().addScheduledTask(() -> {
++                if (activeWorld == unloaded) clearChunks();
++            });
++        }
++    }
++
++    /** Supplies the position/lock expected by LittleTiles, forwarding mesh completion to Celeritas. */
++    public static final class BridgeRenderChunk extends RenderChunk {
++        private final World bridgeWorld;
++
++        BridgeRenderChunk(World world, BlockPos origin) {
++            super(world, Minecraft.getMinecraft().renderGlobal, 0);
++            this.bridgeWorld = world;
++            setPosition(origin.getX(), origin.getY(), origin.getZ());
++        }
++
++        @Override
++        public void setNeedsUpdate(boolean immediate) {
++            if (bridgeWorld != null) markDirty(bridgeWorld, getPosition());
++        }
++
++        @Override
++        public boolean needsUpdate() {
++            return false;
++        }
++    }
++}
+diff --git a/forge122/src/main/java/org/taumc/celeritas/impl/compat/littletiles/LittleTilesMixinPlugin.java b/forge122/src/main/java/org/taumc/celeritas/impl/compat/littletiles/LittleTilesMixinPlugin.java
+new file mode 100644
+index 0000000..042fe6c
+--- /dev/null
++++ b/forge122/src/main/java/org/taumc/celeritas/impl/compat/littletiles/LittleTilesMixinPlugin.java
+@@ -0,0 +1,39 @@
++package org.taumc.celeritas.impl.compat.littletiles;
++
++import org.objectweb.asm.Opcodes;
++import org.objectweb.asm.tree.ClassNode;
++import org.objectweb.asm.tree.MethodNode;
++import org.spongepowered.asm.mixin.extensibility.IMixinConfigPlugin;
++import org.spongepowered.asm.mixin.extensibility.IMixinInfo;
++
++import java.util.List;
++import java.util.Set;
++
++/** Completes LittleTiles' existing cache-monitor protocol without adding a second lock. */
++public final class LittleTilesMixinPlugin implements IMixinConfigPlugin {
++    private static final String CACHE = "com.creativemd.littletiles.client.render.cache.LayeredRenderBufferCache";
++
++    @Override public void onLoad(String mixinPackage) {}
++    @Override public String getRefMapperConfig() { return null; }
++    @Override public boolean shouldApplyMixin(String targetClassName, String mixinClassName) { return true; }
++    @Override public void acceptTargets(Set<String> myTargets, Set<String> otherTargets) {}
++    @Override public List<String> getMixins() { return null; }
++
++    @Override
++    public void preApply(String targetClassName, ClassNode targetClass, String mixinClassName, IMixinInfo mixinInfo) {
++        if (!CACHE.equals(targetClassName)) return;
++        int changed = 0;
++        for (MethodNode method : targetClass.methods) {
++            if ((method.name.equals("get") && method.desc.equals("(I)Lcom/creativemd/littletiles/client/render/cache/IRenderDataCache;"))
++                    || (method.name.equals("hasAdditional") && method.desc.equals("()Z"))
++                    || ((method.name.equals("beforeUpdate") || method.name.equals("afterUpdate")) && method.desc.equals("()V"))) {
++                // The JVM releases a synchronized method's monitor even on exceptional returns.
++                method.access |= Opcodes.ACC_SYNCHRONIZED;
++                changed++;
++            }
++        }
++        if (changed != 4) throw new IllegalStateException("Unsupported LittleTiles cache synchronization API: " + changed);
++    }
++
++    @Override public void postApply(String targetClassName, ClassNode targetClass, String mixinClassName, IMixinInfo mixinInfo) {}
++}
+diff --git a/forge122/src/main/java/org/taumc/celeritas/impl/compat/littletiles/mixin/LayeredRenderBufferCacheMixin.java b/forge122/src/main/java/org/taumc/celeritas/impl/compat/littletiles/mixin/LayeredRenderBufferCacheMixin.java
+new file mode 100644
+index 0000000..8428b70
+--- /dev/null
++++ b/forge122/src/main/java/org/taumc/celeritas/impl/compat/littletiles/mixin/LayeredRenderBufferCacheMixin.java
+@@ -0,0 +1,22 @@
++package org.taumc.celeritas.impl.compat.littletiles.mixin;
++
++import com.llamalad7.mixinextras.injector.ModifyExpressionValue;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.Pseudo;
++import org.spongepowered.asm.mixin.injection.At;
++import org.taumc.celeritas.impl.compat.littletiles.LittleTilesBufferCopy;
++
++import java.nio.ByteBuffer;
++
++@Pseudo
++@Mixin(targets = "com.creativemd.littletiles.client.render.cache.LayeredRenderBufferCache", remap = false)
++public abstract class LayeredRenderBufferCacheMixin {
++    // Transition caches can share IRenderDataCache objects. Keep combine() from
++    // changing cursors used concurrently by another cache or a bridge snapshot.
++    @ModifyExpressionValue(method = "combine", at = @At(value = "INVOKE",
++            target = "Lcom/creativemd/littletiles/client/render/cache/IRenderDataCache;byteBuffer()Ljava/nio/ByteBuffer;"),
++            remap = false, require = 2)
++    private ByteBuffer independentSourceCursor(ByteBuffer source) {
++        return LittleTilesBufferCopy.independentView(source);
++    }
++}
+diff --git a/forge122/src/main/java/org/taumc/celeritas/impl/compat/littletiles/mixin/RenderUploaderMixin.java b/forge122/src/main/java/org/taumc/celeritas/impl/compat/littletiles/mixin/RenderUploaderMixin.java
+new file mode 100644
+index 0000000..9e30b9e
+--- /dev/null
++++ b/forge122/src/main/java/org/taumc/celeritas/impl/compat/littletiles/mixin/RenderUploaderMixin.java
+@@ -0,0 +1,23 @@
++package org.taumc.celeritas.impl.compat.littletiles.mixin;
++
++import net.minecraft.client.renderer.chunk.RenderChunk;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.Pseudo;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++import org.taumc.celeritas.impl.compat.littletiles.LittleTilesCompat;
++
++import java.util.List;
++
++@Pseudo
++@Mixin(targets = "com.creativemd.littletiles.client.render.world.RenderUploader", remap = false)
++public abstract class RenderUploaderMixin {
++    @Inject(method = "uploadRenderData", at = @At("HEAD"), cancellable = true, remap = false)
++    private static void bridgeUpload(RenderChunk chunk, List<?> tiles, CallbackInfo ci) {
++        if (chunk instanceof LittleTilesCompat.BridgeRenderChunk) {
++            chunk.setNeedsUpdate(false);
++            ci.cancel();
++        }
++    }
++}
+diff --git a/forge122/src/main/java/org/taumc/celeritas/impl/compat/littletiles/mixin/RenderUtilsMixin.java b/forge122/src/main/java/org/taumc/celeritas/impl/compat/littletiles/mixin/RenderUtilsMixin.java
+new file mode 100644
+index 0000000..d2e39b6
+--- /dev/null
++++ b/forge122/src/main/java/org/taumc/celeritas/impl/compat/littletiles/mixin/RenderUtilsMixin.java
+@@ -0,0 +1,21 @@
++package org.taumc.celeritas.impl.compat.littletiles.mixin;
++
++import net.minecraft.client.renderer.ViewFrustum;
++import net.minecraft.client.renderer.chunk.RenderChunk;
++import net.minecraft.util.math.BlockPos;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.Pseudo;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
++import org.taumc.celeritas.impl.compat.littletiles.LittleTilesCompat;
++
++@Pseudo
++@Mixin(targets = "com.creativemd.littletiles.client.render.world.RenderUtils", remap = false)
++public abstract class RenderUtilsMixin {
++    @Inject(method = "getRenderChunk(Lnet/minecraft/client/renderer/ViewFrustum;Lnet/minecraft/util/math/BlockPos;)Lnet/minecraft/client/renderer/chunk/RenderChunk;",
++            at = @At("HEAD"), cancellable = true, remap = false)
++    private static void bridgeChunk(ViewFrustum frustum, BlockPos pos, CallbackInfoReturnable<RenderChunk> cir) {
++        cir.setReturnValue(LittleTilesCompat.getRenderChunk(pos));
++    }
++}
+diff --git a/forge122/src/main/java/org/taumc/celeritas/impl/render/terrain/compile/QuadVertexAlpha.java b/forge122/src/main/java/org/taumc/celeritas/impl/render/terrain/compile/QuadVertexAlpha.java
+new file mode 100644
+index 0000000..08d460f
+--- /dev/null
++++ b/forge122/src/main/java/org/taumc/celeritas/impl/render/terrain/compile/QuadVertexAlpha.java
+@@ -0,0 +1,10 @@
++package org.taumc.celeritas.impl.render.terrain.compile;
++
++/** Alpha in the native BLOCK vertex color occupies the high byte (ABGR). */
++public final class QuadVertexAlpha {
++    private QuadVertexAlpha() {}
++
++    public static boolean isOpaque(int first, int second, int third, int fourth) {
++        return ((first & second & third & fourth) >>> 24) == 255;
++    }
++}
+diff --git a/forge122/src/main/java/org/taumc/celeritas/impl/render/terrain/compile/VintageChunkBuildContext.java b/forge122/src/main/java/org/taumc/celeritas/impl/render/terrain/compile/VintageChunkBuildContext.java
+index f377e34..db60986 100644
+--- a/forge122/src/main/java/org/taumc/celeritas/impl/render/terrain/compile/VintageChunkBuildContext.java
++++ b/forge122/src/main/java/org/taumc/celeritas/impl/render/terrain/compile/VintageChunkBuildContext.java
+@@ -162,7 +162,10 @@ public class VintageChunkBuildContext extends ChunkBuildContext {
+                 vertex.trueNormal = trueNormal;
+             }
+             ModelQuadFacing facing = QuadUtil.findNormalFace(trueNormal);
+-            Material correctMaterial = selectMaterial(material, sprite);
++            // Painted LittleTiles may blend an opaque sprite through vertex alpha.
++            // Texture transparency alone must not move those quads to an opaque pass.
++            Material correctMaterial = QuadVertexAlpha.isOpaque(quad[0].color, quad[1].color, quad[2].color, quad[3].color)
++                    ? selectMaterial(material, sprite) : material;
+             buffers.get(correctMaterial).getVertexBuffer(facing).push(quad, correctMaterial);
+         }
+     }
+diff --git a/forge122/src/main/java/org/taumc/celeritas/impl/render/terrain/compile/task/ChunkBuilderMeshingTask.java b/forge122/src/main/java/org/taumc/celeritas/impl/render/terrain/compile/task/ChunkBuilderMeshingTask.java
+index 7ab3ce7..e1d28ce 100644
+--- a/forge122/src/main/java/org/taumc/celeritas/impl/render/terrain/compile/task/ChunkBuilderMeshingTask.java
++++ b/forge122/src/main/java/org/taumc/celeritas/impl/render/terrain/compile/task/ChunkBuilderMeshingTask.java
+@@ -32,6 +32,7 @@ import org.embeddedt.embeddium.impl.render.chunk.terrain.TerrainRenderPass;
+ import org.embeddedt.embeddium.impl.util.task.CancellationToken;
+ import org.joml.Vector3d;
+ import org.taumc.celeritas.impl.compat.fluidlogged.FluidloggedCompat;
++import org.taumc.celeritas.impl.compat.littletiles.LittleTilesCompat;
+ import org.taumc.celeritas.impl.render.terrain.compile.VintageChunkBuildContext;
+ import org.taumc.celeritas.impl.world.WorldSlice;
+ import org.taumc.celeritas.impl.world.cloned.CeleritasBlockAccess;
+@@ -99,8 +100,9 @@ public class ChunkBuilderMeshingTask extends ChunkBuilderTask<ChunkBuildOutput>
+                             continue;
+                         }
+ 
++                        TileEntity tileEntity = null;
+                         if (block.hasTileEntity(blockState)) {
+-                            TileEntity tileEntity = slice.getTileEntity(blockPos);
++                            tileEntity = slice.getTileEntity(blockPos);
+                             if (tileEntity != null) {
+                                 TileEntitySpecialRenderer<TileEntity> tesr = TileEntityRendererDispatcher.instance.getRenderer(tileEntity);
+ 
+@@ -110,6 +112,9 @@ public class ChunkBuilderMeshingTask extends ChunkBuilderTask<ChunkBuildOutput>
+                             }
+                         }
+ 
++                        boolean littleTile = LittleTilesCompat.isLittleTile(tileEntity);
++                        if (littleTile) LittleTilesCompat.requestCache(tileEntity);
++
+                         buildContext.getBlockRenderer().resetSharedState();
+ 
+                         for (BlockRenderLayer layer : VintageChunkBuildContext.LAYERS) {
+@@ -117,7 +122,11 @@ public class ChunkBuilderMeshingTask extends ChunkBuilderTask<ChunkBuildOutput>
+                                 ForgeHooksClient.setRenderLayer(layer);
+                                 // Model rendering is redirected to the fast block renderer by BlockRendererDispatcherMixin
+                                 var buffer = buildContext.getBufferForLayer(layer);
+-                                dispatcher.renderBlock(blockState, blockPos, slice, buffer);
++                                if (littleTile) {
++                                    LittleTilesCompat.append(tileEntity, layer, buffer);
++                                } else {
++                                    dispatcher.renderBlock(blockState, blockPos, slice, buffer);
++                                }
+                             }
+                         }
+ 
+diff --git a/forge122/src/main/resources/mixins.celeritas.littletiles.json b/forge122/src/main/resources/mixins.celeritas.littletiles.json
+new file mode 100644
+index 0000000..7c9a981
+--- /dev/null
++++ b/forge122/src/main/resources/mixins.celeritas.littletiles.json
+@@ -0,0 +1,9 @@
++{
++  "required": true,
++  "minVersion": "0.8",
++  "plugin": "org.taumc.celeritas.impl.compat.littletiles.LittleTilesMixinPlugin",
++  "package": "org.taumc.celeritas.impl.compat.littletiles.mixin",
++  "compatibilityLevel": "JAVA_8",
++  "client": ["RenderUtilsMixin", "RenderUploaderMixin", "LayeredRenderBufferCacheMixin"],
++  "injectors": {"defaultRequire": 1}
++}
