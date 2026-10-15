@@ -1,43 +1,95 @@
+[CmdletBinding()]
+param(
+    [string] $JavaHome = $env:JAVA_HOME,
+    [string] $BuildDirectory = (Join-Path $PSScriptRoot 'build/demonica'),
+    [string] $OutputDirectory = (Join-Path $PSScriptRoot 'dist'),
+    [ValidateRange(6, 16)] [int] $HeapGiB = 10
+)
+
 $ErrorActionPreference = 'Stop'
-$baseCommit = '7818b33172086d0576456a3acf04e1548ddbed74'
-$sourceDir = Join-Path $PSScriptRoot 'upstream'
-$patchFile = Join-Path $PSScriptRoot 'celeritas-ltbridge2.patch'
+$BuildDirectory = [IO.Path]::GetFullPath($BuildDirectory)
+$OutputDirectory = [IO.Path]::GetFullPath($OutputDirectory)
+$baseCommit = '705f596e7800d3dca20a61dd74753d7586beabc1'
+$patchPath = Join-Path $PSScriptRoot 'demonica-0.7.3-dh3.3.3.patch'
+$artifactName = 'Demonica-0.7.3-dh333-ltfix.jar'
 
-function Invoke-GitChecked {
-    param([string[]]$GitArguments)
-    & git @GitArguments
-    if ($LASTEXITCODE -ne 0) { throw 'Git operation failed; existing source files were left for inspection.' }
+function Invoke-Checked {
+    param([string] $Executable, [string[]] $Arguments)
+    & $Executable @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Command failed with exit code ${LASTEXITCODE}: $Executable"
+    }
 }
 
-if (!(Test-Path -LiteralPath $sourceDir)) {
-    Invoke-GitChecked -GitArguments @('clone', '--no-checkout', '--filter=blob:none', 'https://git.taumc.org/embeddedt/celeritas.git', $sourceDir)
-    Invoke-GitChecked -GitArguments @('-C', $sourceDir, 'fetch', '--depth', '1', 'origin', $baseCommit)
-    Invoke-GitChecked -GitArguments @('-C', $sourceDir, 'checkout', '--detach', $baseCommit)
+if (-not $JavaHome) {
+    throw 'Set JAVA_HOME to a JDK 25 installation, or pass -JavaHome.'
 }
-if (!(Test-Path -LiteralPath (Join-Path $sourceDir '.git'))) { throw 'The upstream directory is not a Git checkout.' }
-$head = (& git -C $sourceDir rev-parse HEAD).Trim()
-if ($LASTEXITCODE -ne 0 -or $head -ne $baseCommit) { throw 'The upstream checkout is not at the pinned commit. Inspect it before continuing.' }
-
-& git -C $sourceDir apply --check $patchFile 2>$null
-if ($LASTEXITCODE -eq 0) {
-    Invoke-GitChecked -GitArguments @('-C', $sourceDir, 'apply', $patchFile)
-} else {
-    & git -C $sourceDir apply --reverse --check $patchFile 2>$null
-    if ($LASTEXITCODE -ne 0) { throw 'The patch neither applies cleanly nor appears already applied. Inspect upstream; no reset was performed.' }
+$javaPath = Join-Path $JavaHome 'bin/java.exe'
+if (-not (Test-Path -LiteralPath $javaPath)) {
+    $javaPath = Join-Path $JavaHome 'bin/java'
+}
+if (-not (Test-Path -LiteralPath $javaPath)) {
+    throw 'The selected JavaHome does not contain bin/java.'
+}
+$javaVersion = (& $javaPath --version 2>&1 | Out-String)
+if ($LASTEXITCODE -ne 0 -or $javaVersion -notmatch '(?m)^(openjdk|java) 25(?:[.\s])') {
+    throw 'This build requires JDK 25.'
+}
+if (-not (Test-Path -LiteralPath $patchPath)) {
+    throw "Missing source patch: $patchPath"
 }
 
-Push-Location $sourceDir
+if (Test-Path -LiteralPath $BuildDirectory) {
+    throw 'BuildDirectory already exists. Pass a new empty path to preserve and avoid modifying the existing checkout.'
+}
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $BuildDirectory) | Out-Null
+Invoke-Checked git @('clone', '--depth', '1', '--branch', 'v0.7.3', '--single-branch',
+    'https://github.com/ndellagrotte/Demonica.git', $BuildDirectory)
+$actualCommit = (& git -C $BuildDirectory rev-parse HEAD | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or $actualCommit -ne $baseCommit) {
+    throw "Unexpected upstream commit: $actualCommit"
+}
+Invoke-Checked git @('-C', $BuildDirectory, 'apply', '--check', $patchPath)
+Invoke-Checked git @('-C', $BuildDirectory, 'apply', $patchPath)
+
+# Upstream asks for the latest S8TNLib release. Pin the same library used for the validated build.
+$libraryDirectory = Join-Path $BuildDirectory 'build/local-s8tnlib'
+New-Item -ItemType Directory -Force -Path $libraryDirectory | Out-Null
+$libraries = @{
+    's8tnlib-0.3.0.jar' = 'ba70862c038c887adc3827e45398a8dc870b5879be71f7aa2840fb9a74aca146'
+    's8tnlib-0.3.0-sources.jar' = 'bfa466abdb19f6e5012ee4374218ae24d3b6ac3fb3c3b1e6cf9a08ba97db4297'
+}
+foreach ($name in $libraries.Keys) {
+    $path = Join-Path $libraryDirectory $name
+    Invoke-WebRequest -Uri "https://github.com/ndellagrotte/S8TNLib/releases/download/v0.3.0/$name" -OutFile $path
+    if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $libraries[$name]) {
+        throw "S8TNLib checksum mismatch: $name"
+    }
+}
+
+$previousJavaHome = $env:JAVA_HOME
 try {
-    & .\gradlew.bat '-Pceleritas_target_versions=1.12.2' packageJar --no-daemon
-    if ($LASTEXITCODE -ne 0) { throw 'Celeritas build failed.' }
+    $env:JAVA_HOME = $JavaHome
+    Push-Location $BuildDirectory
+    try {
+        $gradle = if ($env:OS -eq 'Windows_NT') { '.\gradlew.bat' } else { './gradlew' }
+        Invoke-Checked $gradle @('remapJar', 'test', 'verifyCeleritasPin', 'verifyDistributedJar',
+            '--no-daemon', "-Dorg.gradle.jvmargs=-Xmx${HeapGiB}G -XX:+UseG1GC",
+            "-Ps8tnlibDir=$libraryDirectory", '-Ps8tnlibVersion=0.3.0')
+    } finally {
+        Pop-Location
+    }
 } finally {
-    Pop-Location
+    $env:JAVA_HOME = $previousJavaHome
 }
-$jars = @(Get-ChildItem -LiteralPath (Join-Path $sourceDir 'build\libs') -Recurse -Filter 'celeritas-forge-mc12.2-*.jar')
-if ($jars.Count -ne 1) { throw 'Expected one packaged 1.12.2 JAR; inspect upstream/build/libs.' }
-$dist = Join-Path $PSScriptRoot 'dist'
-New-Item -ItemType Directory -Path $dist -Force | Out-Null
-$output = Join-Path $dist 'celeritas-forge-mc12.2-2.5.0-dev-ltbridge2-experimental.jar'
-Copy-Item -LiteralPath $jars[0].FullName -Destination $output -Force
-Write-Output "Built: $output"
-Write-Output 'Experimental build; see QC.md before installing. No Minecraft instance was modified.'
+
+New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
+$artifactPath = Join-Path $BuildDirectory 'build/libs/Demonica-0.7.3.jar'
+$outputPath = Join-Path $OutputDirectory $artifactName
+Copy-Item -LiteralPath $artifactPath -Destination $outputPath
+$sha256 = (Get-FileHash -LiteralPath $outputPath -Algorithm SHA256).Hash.ToLowerInvariant()
+[IO.File]::WriteAllText((Join-Path $OutputDirectory 'SHA256SUMS'), "$sha256  $artifactName`n")
+Write-Host "Built $outputPath"
+Write-Host "SHA-256: $sha256"
+Write-Host 'Install only beside the exact Celeritas build recorded in UPSTREAM.md, on Cleanroom 0.6.12 or 0.6.13.'
+
